@@ -3,11 +3,19 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { listDevicePairing } from "../../infra/device-pairing.js";
 import { NODE_RUNNER_UPDATE_REQUIRED_ISSUE } from "../../infra/node-runner-inventory.js";
 import { NODE_DESKTOP_STREAM_COMMAND } from "../../shared/node-desktop-stream.js";
+import {
+  closeOpenClawStateDatabaseForTest,
+  openOpenClawStateDatabase,
+} from "../../state/openclaw-state-db.js";
 import { collectNodeCatalogRuntimeState } from "../node-registry-private.js";
+import { createDeviceWorkerRuntime } from "../worker-environments/device-provider.js";
 import { summarizeWorkerEnvironment } from "../worker-environments/environment-summary.js";
+import { createWorkerEnvironmentService } from "../worker-environments/service.js";
+import { createWorkerEnvironmentStore } from "../worker-environments/store.js";
 import { environmentsHandlers } from "./environments.js";
 import {
   callEnvironmentMethod,
@@ -32,6 +40,7 @@ vi.mock("../node-registry-private.js", () => ({
   })),
 }));
 
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const NOW = 10_000;
 let runtimeState: ReturnType<typeof collectNodeCatalogRuntimeState>;
 
@@ -60,6 +69,65 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("environment gateway methods", () => {
+  it("advertises a named runtime-local device profile using the core provider without allocating", async () => {
+    const root = tempDirs.make("openclaw-environments-named-device-");
+    const database = openOpenClawStateDatabase({ env: { OPENCLAW_STATE_DIR: root } });
+    const store = createWorkerEnvironmentStore({ database });
+    const config = {
+      cloudWorkers: {
+        profiles: {
+          "dedicated-native": {
+            provider: "device",
+            settings: { device: "scenario2-paired-node", inference: "runtime-local" },
+          },
+        },
+      },
+    };
+    const runtime = createDeviceWorkerRuntime({ getPairedDevice: async () => null });
+    const provision = vi.spyOn(runtime.provider, "provision");
+    const prepareInstallation = vi.fn();
+    const bootstrapWorker = vi.fn();
+    const service = createWorkerEnvironmentService({
+      store,
+      getConfig: () => config,
+      resolveProvider: (id) => (id === "device" ? runtime.provider : undefined),
+      prepareInstallation,
+      bootstrapWorker,
+      executeInference: vi.fn(),
+    });
+    try {
+      const context = { ...mockContext(service), getRuntimeConfig: () => config };
+      const respond = vi.fn();
+      await environmentsHandlers["environments.list"]?.({
+        params: { projection: "profiles" },
+        respond,
+        context,
+      } as never);
+      expect(respond).toHaveBeenCalledWith(
+        true,
+        {
+          environments: [],
+          profiles: [
+            {
+              id: "dedicated-native",
+              providerId: "device",
+              executionMode: "worker-turn",
+              executionModes: ["worker-turn", "remote-exec"],
+            },
+          ],
+        },
+        undefined,
+      );
+      expect(provision).not.toHaveBeenCalled();
+      expect(prepareInstallation).not.toHaveBeenCalled();
+      expect(bootstrapWorker).not.toHaveBeenCalled();
+      expect(store.list()).toEqual([]);
+    } finally {
+      await service.stop();
+      closeOpenClawStateDatabaseForTest();
+    }
+  });
+
   it.each(["locked", "unlocked", "unknown"])(
     "projects %s desktop availability only from its matching live node",
     async (state) => {
