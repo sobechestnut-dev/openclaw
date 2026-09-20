@@ -83,6 +83,7 @@ import {
   resolveTaskForLookupToken,
   updateTaskNotifyPolicyById,
 } from "./task-registry.js";
+import { registerTaskRegistryMaintenanceRetentionTests } from "./task-registry.maintenance-retention.test-support.js";
 import {
   configureTaskRegistryMaintenance,
   getInspectableTaskAuditFindings,
@@ -3495,79 +3496,7 @@ describe("task-registry", () => {
     });
   });
 
-  it("prunes old terminal tasks during maintenance sweeps", async () => {
-    await withTaskRegistryTempDir(async () => {
-      createTaskFixture("cli", {
-        childSessionKey: "agent:main:main",
-        runId: "run-prune",
-        task: "Old completed task",
-        status: "succeeded",
-        startedAt: Date.now() - 9 * 24 * 60 * 60_000,
-        lastEventAt: Date.now() - 8 * 24 * 60 * 60_000,
-      });
-      finalizeTaskRecordByRunId({
-        runId: "run-prune",
-        runtime: "cli",
-        status: "succeeded",
-        endedAt: Date.now() - 8 * 24 * 60 * 60_000,
-        lastEventAt: Date.now() - 8 * 24 * 60 * 60_000,
-      });
-
-      expect(await sweepTaskRegistry()).toEqual({
-        reconciled: 0,
-        recovered: 0,
-        cleanupStamped: 0,
-        pruned: 1,
-      });
-      expect(listTaskRecords()).toStrictEqual([]);
-    });
-  });
-
-  it("previews and repairs missing cleanup timestamps during maintenance", async () => {
-    await withTaskRegistryTempDir(async () => {
-      const now = Date.now();
-      configureTaskRegistryRuntime({
-        store: createInMemoryTaskRegistryStore({
-          tasks: new Map([
-            [
-              "task-missing-cleanup",
-              {
-                taskId: "task-missing-cleanup",
-                runtime: "cli",
-                requesterSessionKey: "",
-                ownerKey: "system:cli:task-missing-cleanup",
-                scopeKind: "system",
-                runId: "run-maintenance-cleanup",
-                task: "Finished CLI task",
-                status: "failed",
-                deliveryStatus: "not_applicable",
-                notifyPolicy: "silent",
-                createdAt: now - 120_000,
-                endedAt: now - 60_000,
-                lastEventAt: now - 60_000,
-              },
-            ],
-          ]),
-          deliveryStates: new Map(),
-        }),
-      });
-
-      expect(previewTaskRegistryMaintenance()).toEqual({
-        reconciled: 0,
-        recovered: 0,
-        cleanupStamped: 1,
-        pruned: 0,
-      });
-
-      expect(await runTaskRegistryMaintenance()).toEqual({
-        reconciled: 0,
-        recovered: 0,
-        cleanupStamped: 1,
-        pruned: 0,
-      });
-      expect(getTaskById("task-missing-cleanup")?.cleanupAfter).toBeGreaterThan(now);
-    });
-  });
+  registerTaskRegistryMaintenanceRetentionTests();
 
   it("cancels the deferred maintenance sweep during test teardown", async () => {
     await withTaskRegistryTempDir(async () => {

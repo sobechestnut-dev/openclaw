@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { expectDefined } from "@openclaw/normalization-core";
+import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db-cache.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import { withTestDir } from "../test-helpers/temp-dir.js";
 import { withEnvAsync } from "../test-utils/env.js";
@@ -167,7 +169,10 @@ export async function withTaskRegistryTempDir<T>(
       try {
         return await run(root);
       } finally {
-        // Close both sqlite-backed registries before Windows temp-dir cleanup tries to remove them.
+        // Forget worker admission before a deleted fixture's inode can be reused.
+        await closeOpenClawStateDatabaseByPathAsync(
+          resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: root }),
+        );
         resetTaskRegistryForTests({ persist: false });
         resetTaskFlowRegistryForTests({ persist: false });
       }
