@@ -221,6 +221,7 @@ function evaluateWorkflowExpression(
     hashFiles: (file: string) => context.fileHashes?.[file] ?? "",
     startsWith: (value: unknown, prefix: unknown) => String(value).startsWith(String(prefix)),
     toJson: (value: unknown) => JSON.stringify(value),
+    toJSON: (value: unknown) => JSON.stringify(value),
     github: {
       actor: context.actor ?? "",
       event_name: context.eventName,
@@ -608,6 +609,7 @@ function runCiManifestFixture(options: {
   androidCiCapabilities?: boolean;
   nativeI18nCapabilities?: boolean;
   macosNodeParts?: boolean;
+  windowsPlanner?: boolean;
   openClawKitTests?: boolean;
   protocolCoverage?: boolean;
   packageVersion?: string;
@@ -666,6 +668,7 @@ function runCiManifestFixture(options: {
             env: {
               OPENCLAW_CI_TEST_COMPACT_MODE: options.compactMode ?? "full",
               OPENCLAW_CI_TEST_RUNNER_BACKEND: options.runnerBackend ?? "",
+              OPENCLAW_CI_TEST_PROOF_TIER: String(options.includeProofTests),
             },
             requiresDist: false,
             runner: "ubuntu-24.04",
@@ -683,6 +686,16 @@ function runCiManifestFixture(options: {
         `,
       "utf8",
     );
+    if (options.windowsPlanner ?? options.bundledPlanner) {
+      appendFileSync(
+        path.join(scriptsDir, "ci-node-test-plan.mts"),
+        `\nexport const createWindowsTestShards = () => Array.from({ length: 5 }, (_, index) => ({
+          check_name: "checks-windows-node-test-" + (index + 1),
+          targets: ["test/windows-part-" + (index + 1) + ".test.ts"],
+          predicted_seconds: 400,
+        }));\n`,
+      );
+    }
     if (options.startupCorpusCoverage) {
       appendFileSync(
         path.join(scriptsDir, "ci-node-test-plan.mts"),
@@ -4810,7 +4823,7 @@ NODE
     expect(workflow.jobs["checks-fast-channel-contracts-shard"].strategy["max-parallel"]).toBe(12);
     expect(workflow.jobs["check-shard"].strategy["max-parallel"]).toBe(12);
     expect(workflow.jobs["check-additional-shard"].strategy["max-parallel"]).toBe(12);
-    expect(workflow.jobs["checks-windows"].strategy["max-parallel"]).toBe(2);
+    expect(workflow.jobs["checks-windows"].strategy["max-parallel"]).toBe(5);
     expect(workflow.jobs.android.strategy["max-parallel"]).toBe(2);
   });
 
@@ -4980,7 +4993,7 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
 
   it.each([
     { eventName: "pull_request" as const, production: false, expected: false },
-    { eventName: "pull_request" as const, production: true, expected: true },
+    { eventName: "pull_request" as const, production: true, expected: false },
     { eventName: "push" as const, production: false, expected: false },
     { eventName: "push" as const, production: true, expected: true },
     { eventName: "workflow_dispatch" as const, production: false, expected: true },
@@ -5091,7 +5104,7 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
     {
       eventName: "pull_request" as const,
       changedPaths: ["extensions/telegram/src/index.ts"],
-      qa: true,
+      qa: false,
       performance: false,
     },
     { eventName: "push" as const, changedPaths: ["ui/src/main.ts"], qa: false, performance: true },
@@ -5129,7 +5142,92 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
     expect(result.outputs.run_control_ui_performance).toBe(String(fixture.performance));
   });
 
-  it("splits Windows tests two ways on every runner backend", () => {
+  it.each([
+    { eventName: "pull_request" as const, releaseGate: false, proof: false },
+    { eventName: "push" as const, releaseGate: false, proof: true },
+    { eventName: "workflow_dispatch" as const, releaseGate: false, proof: true },
+    { eventName: "workflow_dispatch" as const, releaseGate: true, proof: false },
+  ])("routes proof and boundary coverage for $eventName (releaseGate=$releaseGate)", (fixture) => {
+    const manifest = runCiManifestFixture({
+      ...fixture,
+      bundledPlanner: true,
+      historicalCompatibility: false,
+      changedPaths: [
+        "package.json",
+        "scripts/e2e/docker-openai-seed.ts",
+        "src/sqlite-session-owner.ts",
+      ],
+      scopeEnv: { GITHUB_REF: "refs/heads/main", OPENCLAW_CI_RUN_UI_TESTS: "true" },
+    });
+    expect(manifest.status, manifest.output).toBe(0);
+    for (const flag of [
+      "run_proof_tier",
+      "run_docker_seed_e2e",
+      "run_qa_smoke_ci",
+      "run_sqlite_session_lifecycle",
+    ]) {
+      expect(manifest.outputs[flag], flag).toBe(String(fixture.proof));
+    }
+    for (const flag of [
+      "run_build_artifacts",
+      "run_ui_tests",
+      "run_ui_e2e",
+      "run_checks_windows",
+      "run_channel_contracts_shards",
+    ]) {
+      expect(manifest.outputs[flag], flag).toBe("true");
+    }
+    const nodeRows = JSON.parse(
+      expectDefined(manifest.outputs.checks_node_core_nondist_matrix, "Node matrix"),
+    ).include;
+    expect(nodeRows).toContainEqual(
+      expect.objectContaining({
+        check_name: "bundled-node-plan",
+        env: expect.objectContaining({ OPENCLAW_CI_TEST_PROOF_TIER: String(fixture.proof) }),
+      }),
+    );
+
+    const workflow = readCiWorkflow();
+    const context = {
+      ...fixture,
+      repository: "openclaw/openclaw",
+      runAttempt: 1,
+      preflightOutputs: { ...manifest.outputs, run_checks_node_core_dist: "true" },
+    };
+    const evaluateCondition = (expression: string) =>
+      evaluateWorkflowExpression(
+        expression.startsWith("${{") ? expression : `\${{ ${expression} }}`,
+        context,
+      );
+    expect(evaluateCondition(workflow.jobs["checks-ui-e2e"].if)).toBe(true);
+    expect(evaluateCondition(workflow.jobs["checks-ui-e2e-real-gateway"].if)).toBe(fixture.proof);
+    const steps = workflow.jobs["build-artifacts"].steps as WorkflowStep[];
+    const verifiers = expectDefined(
+      steps.find((step) => step.name === "Run built artifact checks"),
+      "built verifiers",
+    );
+    for (const name of ["RUN_PROCESS_PROOFS", "RUN_GATEWAY_WATCH", "RUN_TUI_PTY"]) {
+      expect(String(evaluateWorkflowExpression(verifiers.env?.[name], context)), name).toBe(
+        String(fixture.proof),
+      );
+    }
+    for (const name of ["RUN_CHANNELS", "RUN_CORE_SUPPORT_BOUNDARY"]) {
+      expect(String(evaluateWorkflowExpression(verifiers.env?.[name], context)), name).toBe("true");
+    }
+    for (const name of [
+      "Verify built browser native host",
+      "Upload Discord component attachment proof",
+      "Upload gateway watch regression artifacts",
+    ]) {
+      const step = expectDefined(
+        steps.find((candidate) => candidate.name === name),
+        name,
+      );
+      expect(evaluateCondition(expectDefined(step.if, name)), name).toBe(fixture.proof);
+    }
+  });
+
+  it("uses target-owned Windows shards on every runner backend and preserves frozen plans", () => {
     const workflow = readCiWorkflow();
     const runStep = workflow.jobs["checks-windows"].steps.find(
       (step: WorkflowStep) => step.name === "Run ${{ matrix.task }} (${{ matrix.runtime }})",
@@ -5163,13 +5261,13 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
     expect(github.status, github.output).toBe(0);
     expect(hybrid.status, hybrid.output).toBe(0);
     expect(hybridDispatch.status, hybridDispatch.output).toBe(0);
-    // Blacksmith's Windows class admits exactly 2 concurrent jobs (run
-    // 31865243804), so every backend uses the same 2-part split: a 3rd part
-    // queues behind a finished one and a single lane serializes the whole body.
-    const expectedWindowsMatrix = [
-      { check_name: "checks-windows-node-test-1", runtime: "node", task: "test-1" },
-      { check_name: "checks-windows-node-test-2", runtime: "node", task: "test-2" },
-    ];
+    const expectedWindowsMatrix = Array.from({ length: 5 }, (_, index) =>
+      expect.objectContaining({
+        check_name: `checks-windows-node-test-${index + 1}`,
+        targets: [`test/windows-part-${index + 1}.test.ts`],
+        predicted_seconds: 400,
+      }),
+    );
     for (const [label, manifest] of [
       ["Blacksmith", blacksmith],
       ["GitHub", github],
@@ -5182,6 +5280,15 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
         label,
       ).toEqual(expectedWindowsMatrix);
     }
+    const frozen = runCiManifestFixture({ bundledPlanner: true, windowsPlanner: false });
+    expect(frozen.status, frozen.output).toBe(0);
+    expect(
+      JSON.parse(expectDefined(frozen.outputs.checks_windows_matrix, "frozen Windows matrix"))
+        .include,
+    ).toEqual([
+      { check_name: "checks-windows-node-test-1", runtime: "node", task: "test-1" },
+      { check_name: "checks-windows-node-test-2", runtime: "node", task: "test-2" },
+    ]);
     expect(runStep.run).toContain('scripts?.["test:windows:ci:1"]');
     expect(runStep.run).toContain('scripts?.["test:windows:ci:2"]');
     expect(runStep.run).toContain("pnpm test:windows:ci");
@@ -5235,7 +5342,7 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
   );
 
   it.skipIf(process.platform === "win32")(
-    "keeps Windows projects serial on each runner while both jobs remain parallel",
+    "keeps Windows projects serial on each runner while shard jobs remain parallel",
     () => {
       const workflow = readCiWorkflow();
       const job = workflow.jobs["checks-windows"];
@@ -5257,7 +5364,17 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
         '#!/bin/sh\nprintf "project_parallelism=%s\\n" "${OPENCLAW_TEST_PROJECTS_PARALLEL:-1}"\n',
       );
       chmodSync(pnpm, 0o755);
-      for (const task of ["test-1", "test-2"]) {
+      const targets = ["test/windows-first.test.ts", "test/windows-second.test.ts"];
+      mkdirSync(path.join(cwd, "scripts"));
+      writeFileSync(path.join(cwd, "scripts/tsx.mjs"), "export {};\n");
+      writeFileSync(
+        path.join(cwd, "scripts/test-projects.mts"),
+        `
+        console.log("project_parallelism=" + process.env.OPENCLAW_TEST_PROJECTS_PARALLEL);
+        console.log("targets=" + JSON.stringify(process.argv.slice(2)));
+      `,
+      );
+      for (const task of ["test", "test-1", "test-2"]) {
         for (const runner of ["github-hosted", "self-hosted"]) {
           const result = runWorkflowShellScript(runStep.run, {
             cwd,
@@ -5265,15 +5382,26 @@ require("node:fs").writeFileSync("scheduler-baseline", process.env.OPENCLAW_UPGR
               ...process.env,
               PATH: `${bin}${path.delimiter}${process.env.PATH}`,
               TASK: task,
+              WINDOWS_TARGETS_JSON: String(
+                evaluateWorkflowExpression(runStep.env.WINDOWS_TARGETS_JSON, {
+                  eventName: "push",
+                  repository: "openclaw/openclaw",
+                  runAttempt: 1,
+                  matrix: { targets },
+                }),
+              ),
               RUNNER_ENVIRONMENT: runner,
               OPENCLAW_TEST_PROJECTS_PARALLEL: undefined,
             },
           });
           expect(result.status, result.stdout + result.stderr).toBe(0);
           expect(result.stdout).toContain("project_parallelism=1");
+          if (task === "test") {
+            expect(result.stdout).toContain(`targets=${JSON.stringify(targets)}`);
+          }
         }
       }
-      expect(job.strategy["max-parallel"]).toBe(2);
+      expect(job.strategy["max-parallel"]).toBe(5);
       expect(job.env.OPENCLAW_VITEST_MAX_WORKERS).toBe(1);
     },
   );
@@ -13786,7 +13914,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       );
       expect(
         JSON.parse(expectDefined(manifest.outputs.checks_windows_matrix, "Windows matrix")).include,
-      ).toHaveLength(selectedJobs.includes("checks-windows") ? 2 : 0);
+      ).toHaveLength(selectedJobs.includes("checks-windows") ? 5 : 0);
       if (eventName === "pull_request" && selectedJobs.includes("android")) {
         expect(
           JSON.parse(expectDefined(preflightOutputs.android_matrix, "Android matrix")).include,
@@ -14220,6 +14348,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
         env: {
           OPENCLAW_CI_TEST_COMPACT_MODE: "full",
           OPENCLAW_CI_TEST_RUNNER_BACKEND: "blacksmith",
+          OPENCLAW_CI_TEST_PROOF_TIER: "true",
         },
         shard_name: "bundled-node-plan",
       }),
@@ -14245,6 +14374,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
           env: {
             OPENCLAW_CI_TEST_COMPACT_MODE: "push",
             OPENCLAW_CI_TEST_RUNNER_BACKEND: runnerBackend ?? "blacksmith",
+            OPENCLAW_CI_TEST_PROOF_TIER: "true",
           },
         }),
       );
@@ -14283,8 +14413,8 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
     );
     expect(changedPullRequest.outputs.run_checks_node_core_dist).toBe("true");
     expect(changedPullRequest.outputs.run_sqlite_session_lifecycle).toBe("false");
-    expect(changedPullRequest.outputs.run_docker_seed_e2e).toBe("true");
-    expect(changedPullRequest.outputs.docker_seed_lanes).toBe("mcp-channels cron-mcp-cleanup");
+    expect(changedPullRequest.outputs.run_docker_seed_e2e).toBe("false");
+    expect(changedPullRequest.outputs.docker_seed_lanes).toBe("");
 
     const mixedFallbackPullRequest = runCiManifestFixture({
       bundledPlanner: true,
@@ -14309,6 +14439,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
           env: {
             OPENCLAW_CI_TEST_COMPACT_MODE: "pull-request",
             OPENCLAW_CI_TEST_RUNNER_BACKEND: "blacksmith",
+            OPENCLAW_CI_TEST_PROOF_TIER: "false",
           },
         }),
         expect.objectContaining({ check_name: "changed-extension-fallback-plan" }),
@@ -14350,8 +14481,8 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       eventName: "pull_request",
     });
     expect(sqliteLifecycleTestPullRequest.status, sqliteLifecycleTestPullRequest.output).toBe(0);
-    expect(sqliteLifecycleTestPullRequest.outputs.run_sqlite_session_lifecycle).toBe("true");
-    expect(sqliteLifecycleTestPullRequest.outputs.run_build_artifacts).toBe("true");
+    expect(sqliteLifecycleTestPullRequest.outputs.run_sqlite_session_lifecycle).toBe("false");
+    expect(sqliteLifecycleTestPullRequest.outputs.run_build_artifacts).toBe("false");
 
     const emptyPullRequest = runCiManifestFixture({
       bundledPlanner: true,
@@ -14428,7 +14559,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       qaSmokePlan: false,
     });
     expect(currentMissingQaPlan.status, currentMissingQaPlan.output).toBe(0);
-    expect(currentMissingQaPlan.outputs.run_qa_smoke_ci).toBe("true");
+    expect(currentMissingQaPlan.outputs.run_qa_smoke_ci).toBe("false");
 
     const frozenMissingCurrentCapabilities = runCiManifestFixture({
       bundledPlanner: true,
@@ -14959,7 +15090,9 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
 
     expect(uiE2eRealGateway.permissions).toEqual(uiE2e.permissions);
     expect(uiE2eRealGateway.needs).toEqual(uiE2e.needs);
-    expect(uiE2eRealGateway.if).toBe(uiE2e.if);
+    expect(uiE2eRealGateway.if).toBe(
+      "needs.preflight.outputs.run_proof_tier == 'true' && needs.preflight.outputs.run_ui_e2e == 'true' && needs.preflight.outputs.compatibility_target != 'true'",
+    );
     expect(uiE2eRealGateway.env).toBeUndefined();
 
     const uiE2eSetup = expectDefined(
@@ -15743,11 +15876,11 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       'run_verifier "doctor-plugin-index" run_doctor_plugin_index',
     );
     const parallelDiscord = verifierStep.run.indexOf(
-      'if [ "$RUN_CHANNELS" = "true" ] && [ "$PARALLEL_BUILT_VERIFIERS" = "true" ]; then',
+      'if [ "$RUN_PROCESS_PROOFS" = "true" ] && [ "$RUN_CHANNELS" = "true" ] && [ "$PARALLEL_BUILT_VERIFIERS" = "true" ]; then',
     );
     const readerWaveBarrier = verifierStep.run.indexOf("\nwait_checks\n", parallelDiscord);
     const hostedDiscord = verifierStep.run.indexOf(
-      'if [ "$RUN_CHANNELS" = "true" ] && [ "$PARALLEL_BUILT_VERIFIERS" != "true" ]; then',
+      'if [ "$RUN_PROCESS_PROOFS" = "true" ] && [ "$RUN_CHANNELS" = "true" ] && [ "$PARALLEL_BUILT_VERIFIERS" != "true" ]; then',
     );
     expect(pluginWriterBarrier).toBeGreaterThan(pluginSingleton);
     expect(parallelGatewayWatch).toBeGreaterThan(pluginWriterBarrier);
@@ -15768,7 +15901,9 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
     const upload = steps.find(
       (entry: WorkflowStep) => entry.name === "Upload Discord component attachment proof",
     );
-    expect(upload.if).toBe("always() && needs.preflight.outputs.run_checks == 'true'");
+    expect(upload.if).toBe(
+      "always() && needs.preflight.outputs.run_proof_tier == 'true' && needs.preflight.outputs.run_checks == 'true'",
+    );
     expect(upload.with.path).toContain("${{ runner.temp }}/discord-component-attachments.json");
     expect(upload.with.path).toContain("${{ runner.temp }}/discord-component-attachments.log");
     // Every verifier reports through the shared results map so a failure can
@@ -15857,6 +15992,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
             repository: "openclaw/openclaw",
             runAttempt: 1,
             frozenTarget: frozen,
+            preflightOutputs: { run_proof_tier: "true" },
             fileHashes: present ? { [file]: "fixture-hash" } : {},
           }),
       ).toBe(expected);
@@ -16143,10 +16279,10 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
     const tuiPty = run.indexOf('if [ "$RUN_TUI_PTY" = "true" ]; then');
     const hostedGatewayWait = run.indexOf("\n  wait_checks\n", hostedGatewayWatch);
     const parallelDiscord = run.indexOf(
-      'if [ "$RUN_CHANNELS" = "true" ] && [ "$PARALLEL_BUILT_VERIFIERS" = "true" ]; then',
+      'if [ "$RUN_PROCESS_PROOFS" = "true" ] && [ "$RUN_CHANNELS" = "true" ] && [ "$PARALLEL_BUILT_VERIFIERS" = "true" ]; then',
     );
     const hostedDiscord = run.indexOf(
-      'if [ "$RUN_CHANNELS" = "true" ] && [ "$PARALLEL_BUILT_VERIFIERS" != "true" ]; then',
+      'if [ "$RUN_PROCESS_PROOFS" = "true" ] && [ "$RUN_CHANNELS" = "true" ] && [ "$PARALLEL_BUILT_VERIFIERS" != "true" ]; then',
     );
     const hostedDiscordWait = run.indexOf("\n  wait_checks\n", hostedDiscord);
     const tuiPtyWait = run.indexOf("\n  wait_checks\n", tuiPty);
