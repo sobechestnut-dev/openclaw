@@ -85,6 +85,15 @@ function readPool(): ReadPool {
 }
 
 function captureCommand(command: OpenClawStateReadCommand): OpenClawStateReadCommand {
+  if (
+    command.type === "skills.library.descriptions" ||
+    command.type === "skills.library.manifests"
+  ) {
+    return {
+      type: command.type,
+      input: command.input.map(({ skillId, revision }) => ({ skillId, revision })),
+    };
+  }
   if (command.type === "audit.run.inspect") {
     const input = command.input;
     const common = {
@@ -118,6 +127,16 @@ function commandBytes(command: OpenClawStateReadRequest["command"]): number {
       bytes +
       Buffer.byteLength(command.backendId, "utf8") +
       Buffer.byteLength(command.scopeKey, "utf8")
+    );
+  }
+  if (
+    command.type === "skills.library.descriptions" ||
+    command.type === "skills.library.manifests"
+  ) {
+    return command.input.reduce(
+      (total, pin) =>
+        total + Buffer.byteLength(pin.skillId, "utf8") + Buffer.byteLength(pin.revision, "utf8"),
+      bytes,
     );
   }
   if (command.type === "fleet.get") {
