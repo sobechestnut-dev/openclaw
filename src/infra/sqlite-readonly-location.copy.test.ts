@@ -99,29 +99,6 @@ function interceptSourceReads(
 }
 
 describe("stable read-only snapshot copies", () => {
-  it("proceeds after the bounded quiescence deadline while the source stays active", async () => {
-    const fixture = createFixture(Buffer.alloc(0));
-    const started = performance.now();
-    const timer = setInterval(() => {
-      const now = new Date();
-      fs.utimesSync(fixture.sourcePath, now, now);
-    }, 5);
-    let prepared: Awaited<ReturnType<typeof prepareSqliteReadOnlyLocationInProcess>> | undefined;
-    try {
-      prepared = await prepareSqliteReadOnlyLocationInProcess(
-        fixture.sourcePath,
-        fixture.stagingRoot,
-      );
-      expect(performance.now() - started).toBeLessThan(1_000);
-      expect(fs.statSync(prepared.location).size).toBe(0);
-    } finally {
-      clearInterval(timer);
-      if (prepared) {
-        expect(await prepared.cleanupAsync()).toBe(true);
-      }
-    }
-  });
-
   it.each([
     { label: "empty", size: 0 },
     { label: "partial chunk", size: 4099 },

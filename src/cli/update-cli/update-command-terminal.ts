@@ -65,8 +65,13 @@ export function hasDeferredUpdateCommandTerminalResult(run: Run): boolean {
 export async function prepareUnexpectedUpdateCommandFailure(
   error: unknown,
   opts: UpdateCommandOptions & { run: Run },
+  onPublishedRecord?: PublishedRecord,
 ): Promise<UpdateCommandFailure> {
-  const failure = { mode: "unknown" as const, durationMs: 0, failure: { cause: error } };
+  const failure = {
+    mode: "unknown" as const,
+    durationMs: 0,
+    failure: { cause: error, detail: formatErrorMessage(error) },
+  };
   let fact: UpdateFailureFact;
   try {
     const recorded = failUpdateCommandRun(error, opts.run);
@@ -94,7 +99,7 @@ export async function prepareUnexpectedUpdateCommandFailure(
     );
   };
   if (!deferUpdateCommandTerminalResult(opts.run, publish)) {
-    await publish();
+    await publish(undefined, onPublishedRecord);
   }
   return new UpdateCommandFailure(result, 1, fact.message, { cause: error });
 }
