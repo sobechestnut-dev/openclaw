@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 364252,
-  "reason": "Peter approved the sub-1% PR-caused bump for #153178: shared update-outcome identifiers need 54 B more startup gzip budget (356.2 to 356.3 KiB). The existing 512 B growth and 64 B build-variance allowances are unchanged.",
+  "startupJsGzipBytes": 364954,
+  "reason": "Peter approved the measured #153178 rebase baseline: 364950 B rounds up to 364954 B (356.4 KiB). Main drift added 94 B between CI merge trees; two unchanged-tree builds were identical. The existing 512 B growth and 64 B build-variance allowances remain unchanged, giving an explicit 365530 B enforcement limit.",
   "updatedAt": "2026-09-20"
 }
