@@ -10,6 +10,7 @@ export async function runWithAsyncWorkResources<T>(
     onAcquired: (resources: AsyncWorkResources) => void,
     captureWorkContext: () => void,
   ) => Promise<T>,
+  options?: { cancelOnError: boolean },
 ): Promise<T> {
   const result = createDeferredCore<T>();
   const trackOwner = captureAsyncWorkTracker();
@@ -37,6 +38,11 @@ export async function runWithAsyncWorkResources<T>(
         ),
       );
     } catch (error) {
+      // Callers abandoning work on failure must join its cleanup before retrying.
+      if (options?.cancelOnError) {
+        runInContext(() => work.beginClose(error));
+        await runInContext(() => work.drain());
+      }
       result.reject(error);
     } finally {
       try {
